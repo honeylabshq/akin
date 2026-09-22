@@ -1,0 +1,33 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: fuzz smoke
+        run: go test -run '^$' -fuzz FuzzFingerprint -fuzztime 30s .
+      - name: reference agreement
+        run: |
+          go build -o /tmp/akin ./cmd/akin
+          python3 - <<'PY'
+          import json, subprocess, sys
+          sys.path.insert(0, "reference")
+          from reference import fingerprint
+          vectors = json.load(open("testdata/vectors.json"))
+          hexes = "\n".join(v["request_hex"] for v in vectors)
+          go = subprocess.run(["/tmp/akin", "-hex"], input=hexes, text=True,
+                              capture_output=True).stdout.split("\n")
+          for v, got in zip(vectors, go):
+              want = fingerprint(bytes.fromhex(v["request_hex"]))
+              assert got == want == v["fingerprint"], (v["name"], got, want, v["fingerprint"])
+          print(f"{len(vectors)} vectors agree across Go and Python")
+          PY

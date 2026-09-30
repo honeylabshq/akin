@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -48,19 +49,115 @@ func TestNotHTTP(t *testing.T) {
 	}
 }
 
-// TestDistance is the property the format exists for: one added vocabulary
-// header must move the token by exactly one.
+// TestDistance is the property the format exists for: one added header must
+// move the token by exactly one, whether or not the header is in the core list.
 func TestDistance(t *testing.T) {
 	base := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n"))
 	plus := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n\r\n"))
-	if d := Distance(base, plus); d != 1 {
-		t.Errorf("Distance = %d, want 1", d)
+	extra := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nX-Api-Key: k\r\n\r\n"))
+	both := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nX-Api-Key: k\r\n\r\n"))
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{base, plus, 1},
+		{base, extra, 1},
+		{base, both, 2},
+		{plus, extra, 2},
+		{extra, both, 1},
+		{base, base, 0},
+		{extra, extra, 0},
+		{"garbage", base, -1},
+		{base, "a11cun030_00000049_54d07b6d", -1}, // the previous format is not comparable
 	}
-	if d := Distance(base, base); d != 0 {
-		t.Errorf("Distance to self = %d, want 0", d)
+	for _, c := range cases {
+		if d := Distance(c.a, c.b); d != c.want {
+			t.Errorf("Distance(%s, %s) = %d, want %d", c.a, c.b, d, c.want)
+		}
 	}
-	if d := Distance("garbage", base); d != -1 {
-		t.Errorf("Distance(garbage) = %d, want -1", d)
+}
+
+// TestExtras pins the section that carries headers outside the core list:
+// codes are sorted, deduplicated, capped at MaxExtras, and absent when there
+// are none, so the prefix digit and the section always agree.
+func TestExtras(t *testing.T) {
+	fp := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nX-Foo: 1\r\nx-bar: 2\r\nX-FOO: 3\r\n\r\n"))
+	f, err := Decode(fp)
+	if err != nil {
+		t.Fatalf("%s: %v", fp, err)
+	}
+	if f.Extras != 2 || len(f.Codes) != 2 {
+		t.Errorf("extras = %d, codes = %v, want 2 and 2 (%s)", f.Extras, f.Codes, fp)
+	}
+	want := []string{Code("x-foo"), Code("x-bar")}
+	sort.Strings(want)
+	if f.Codes[0] != want[0] || f.Codes[1] != want[1] {
+		t.Errorf("codes = %v, want %v", f.Codes, want)
+	}
+	if !f.Duplicate {
+		t.Errorf("X-Foo repeated in a different case must set the duplicate flag: %s", fp)
+	}
+
+	none := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+	if strings.Count(none, "_") != 2 {
+		t.Errorf("no extras must mean no extras section: %s", none)
+	}
+
+	req := "GET / HTTP/1.1\r\n"
+	for i := 0; i < 12; i++ {
+		req += "X-H" + string(rune('a'+i)) + ": v\r\n"
+	}
+	many, err := Decode(Fingerprint([]byte(req + "\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if many.Extras != MaxExtras || len(many.Codes) != MaxExtras || !sort.StringsAreSorted(many.Codes) {
+		t.Errorf("12 extras must be capped at %d sorted codes, got %d/%v", MaxExtras, many.Extras, many.Codes)
+	}
+	if !sort.StringsAreSorted(f.Codes) {
+		t.Errorf("codes not sorted: %v", f.Codes)
+	}
+}
+
+func TestCode(t *testing.T) {
+	if Code("Range") != Code("range") || len(Code("range")) != 4 {
+		t.Errorf("Code must be four hex digits of the lowercased name, got %q and %q", Code("Range"), Code("range"))
+	}
+	if Lookup([]string{"Range"})[Code("range")] != "range" {
+		t.Error("Lookup must map a code back to the lowercased name")
+	}
+}
+
+func TestDecode(t *testing.T) {
+	f, err := Decode("b11cun030_00040014_54d07b6d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.HTTPVersion != "11" || !f.CRLF || f.Duplicate || f.Body != 'n' || f.Headers != 3 || f.Extras != 0 ||
+		f.Core != 0x00040014 || f.Detail != "54d07b6d" || f.Session != 0 || len(f.Codes) != 0 {
+		t.Errorf("unexpected fields: %+v", f)
+	}
+	if strings.Join(f.CoreNames, ",") != "accept,user-agent,host" {
+		t.Errorf("core names = %v", f.CoreNames)
+	}
+	if f, err := Decode("b11cun030_00040014_54d07b6d_c"); err != nil || f.Session != 'c' {
+		t.Errorf("session field: %+v %v", f, err)
+	}
+	if f, err := Decode("b11cun031_00040014_54d07b6d_x2269_1"); err != nil || f.Session != '1' || len(f.Codes) != 1 {
+		t.Errorf("extras then session: %+v %v", f, err)
+	}
+	bad := []string{
+		"", "b11cun030", "a11cun030_00000049_54d07b6d", "b11cun030_0004001_54d07b6d",
+		"b11cun030_00040014_54d07b6", "b11cun031_00040014_54d07b6d", // extras digit without a section
+		"b11cun030_00040014_54d07b6d_x2269",     // section without the digit
+		"b11cun032_00040014_54d07b6d_x2f932269", // codes out of order
+		"b11cun030_00040014_54d07b6d_1_x2269",   // sections out of order
+		"b11cun030_00040014_54d07b6d_c_c", "b11cxn030_00040014_54d07b6d", "b11cun030_00040014_54d07b6d_z",
+	}
+	for _, tok := range bad {
+		if _, err := Decode(tok); err == nil {
+			t.Errorf("Decode(%q) accepted a malformed token", tok)
+		}
 	}
 }
 
@@ -88,24 +185,23 @@ func TestSessionField(t *testing.T) {
 	}
 }
 
-// TestVocabFrozen guards the one thing that must never drift: bit positions are
+// TestCoreFrozen guards the one thing that must never drift: bit positions are
 // normative, so a reorder silently breaks comparability across implementations.
-func TestVocabFrozen(t *testing.T) {
-	want := "accept|connection|accept-encoding|host|accept-language|upgrade-insecure-requests|" +
-		"user-agent|range|cache-control|content-length|content-type|sec-fetch-mode|pragma|" +
-		"sec-fetch-dest|sec-fetch-site|sec-fetch-user|metadata-flavor|metadata|" +
-		"sec-ch-ua-platform|sec-ch-ua-mobile|sec-ch-ua|x-requested-with|referer|accept-charset|" +
-		"x-csrf-token|proxy-authorization|origin|wsmanidentify|sec-gpc|upgrade|" +
-		"sec-websocket-version|sec-websocket-key"
+func TestCoreFrozen(t *testing.T) {
+	want := "connection|accept-encoding|accept|accept-language|user-agent|upgrade-insecure-requests|" +
+		"sec-fetch-mode|sec-fetch-site|sec-fetch-dest|sec-fetch-user|referer|content-length|" +
+		"sec-ch-ua-platform|sec-ch-ua|sec-ch-ua-mobile|sec-gpc|content-type|accept-charset|host|" +
+		"priority|cache-control|pragma|authorization|soapaction|dnt|wsmanidentify|x-aggregate-auth|" +
+		"cookie|origin|mcp-protocol-version|upgrade|x-forwarded-for"
 	got := ""
-	for i, n := range Vocab {
+	for i, n := range Core {
 		if i > 0 {
 			got += "|"
 		}
 		got += n
 	}
 	if got != want {
-		t.Errorf("vocabulary changed, every fingerprint moves:\n got %s\nwant %s", got, want)
+		t.Errorf("core list changed, every fingerprint moves:\n got %s\nwant %s", got, want)
 	}
 }
 
@@ -135,9 +231,8 @@ func BenchmarkFingerprint(b *testing.B) {
 	}
 }
 
-// TestDuplicateMixedCase covers a bug where duplicate detection compared
-// lowered names held in a reused scratch buffer, so a longer header later in
-// the request could corrupt an earlier comparison.
+// TestDuplicateMixedCase pins duplicate detection to the lowercased name,
+// whatever else sits between the two occurrences.
 func TestDuplicateMixedCase(t *testing.T) {
 	cases := []struct {
 		name string
@@ -162,8 +257,8 @@ func TestDuplicateMixedCase(t *testing.T) {
 	}
 }
 
-// TestLongHeaderName exercises the fallback path where a name does not fit the
-// stack buffer.
+// TestLongHeaderName checks that an 80-character name is handled like any
+// other, including duplicate detection.
 func TestLongHeaderName(t *testing.T) {
 	long := ""
 	for i := 0; i < 80; i++ {
@@ -199,5 +294,19 @@ func TestPrefixWidth(t *testing.T) {
 		if len(prefix) != 9 {
 			t.Errorf("%q: prefix %q is %d chars, want 9", req, prefix, len(prefix))
 		}
+	}
+}
+
+// TestOrderIndependent: the same headers in any order give the same token.
+// Header order follows the disguise, not the client.
+func TestOrderIndependent(t *testing.T) {
+	a := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nX-Foo: 1\r\nUser-Agent: u\r\n\r\n"))
+	b := Fingerprint([]byte("GET / HTTP/1.1\r\nUser-Agent: u\r\nX-Foo: 1\r\nAccept-Encoding: gzip\r\nAccept: */*\r\nHost: a\r\n\r\n"))
+	if a != b {
+		t.Errorf("order changed the token:\n%s\n%s", a, b)
+	}
+	c := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nX-Foo: 1\r\nUser-Agent: u\r\n\r\n"))
+	if a == c {
+		t.Errorf("a different negotiation value shape must change the detail hash: %s", a)
 	}
 }

@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-// TestSpecVocabularyMatchesCode stops the specification and the
+// TestSpecCoreMatchesCode stops the specification and the
 // implementation drifting apart. Bit positions are normative, so a vocabulary
-// table in SPEC.md that disagrees with Vocab would make two conforming
+// table in SPEC.md that disagrees with Core would make two conforming
 // implementations produce different fingerprints for the same request.
-func TestSpecVocabularyMatchesCode(t *testing.T) {
+func TestSpecCoreMatchesCode(t *testing.T) {
 	raw, err := os.ReadFile("SPEC.md")
 	if err != nil {
 		t.Fatalf("read SPEC.md: %v", err)
@@ -21,12 +21,12 @@ func TestSpecVocabularyMatchesCode(t *testing.T) {
 	fromSpec := map[int]string{}
 	for _, m := range entry.FindAllStringSubmatch(string(raw), -1) {
 		i, err := strconv.Atoi(m[1])
-		if err != nil || i >= len(Vocab) {
+		if err != nil || i >= len(Core) {
 			continue
 		}
 		// Only accept names that are actually header-shaped, so prose
 		// containing a number followed by a word is not mistaken for a row.
-		if _, ok := vocabIndex[m[2]]; !ok {
+		if _, ok := coreIndex[m[2]]; !ok {
 			continue
 		}
 		if prev, seen := fromSpec[i]; seen && prev != m[2] {
@@ -34,10 +34,10 @@ func TestSpecVocabularyMatchesCode(t *testing.T) {
 		}
 		fromSpec[i] = m[2]
 	}
-	if len(fromSpec) != len(Vocab) {
-		t.Fatalf("SPEC.md lists %d vocabulary entries, code has %d", len(fromSpec), len(Vocab))
+	if len(fromSpec) != len(Core) {
+		t.Fatalf("SPEC.md lists %d core entries, code has %d", len(fromSpec), len(Core))
 	}
-	for i, name := range Vocab {
+	for i, name := range Core {
 		if fromSpec[i] != name {
 			t.Errorf("bit %d: SPEC.md says %q, code says %q", i, fromSpec[i], name)
 		}
@@ -65,7 +65,7 @@ func TestDocumentedTokensReproduce(t *testing.T) {
 		}
 	}
 	// Every token-shaped string in the docs must at least be well formed.
-	token := regexp.MustCompile(`\ba[0-9]{2}[cl][du][qkn][0-9]{3}_[0-9a-f]{8}_[0-9a-f]{8}\b`)
+	token := regexp.MustCompile(`\bb[0-9]{2}[cl][du][qkn][0-9]{3}_[0-9a-f]{8}_[0-9a-f]{8}(?:_x[0-9a-f]{4,36})?(?:_[1cg])?\b`)
 	for _, file := range []string{"README.md", "SPEC.md"} {
 		raw, err := os.ReadFile(file)
 		if err != nil {

@@ -1,18 +1,32 @@
-// Package akin computes the Akin HTTP request fingerprint.
+// Package akin computes the Akin HTTP request fingerprint, format b.
 //
 // Akin identifies an HTTP/1.x client from a single bare request head. It needs
-// no pcap, no TLS handshake and no connection state, so it works anywhere the
-// request bytes are available.
+// no packet capture, no TLS handshake and no connection state, so it can be
+// computed wherever the request bytes are available: a honeypot, a proxy log,
+// a WAF, a stored column.
 //
-// The middle section of the token is a presence bitmap over a frozen header
-// vocabulary rather than a hash, so the Hamming distance between two tokens is
-// the number of vocabulary headers the two clients differ by. See SPEC.md.
+// A token has a nine-character readable prefix, a 32-bit map over a frozen
+// core list of header names, a hash over the grammar of the negotiation
+// header values and the casing of the header names, an optional list of
+// 16-bit codes for the headers outside the core list, and an optional
+// session field:
+//
+//	b11cun030_00000049_54d07b6d              default curl
+//	b11cun141_1c3e8c8b_9f0d6a11_x0c47        a browser-shaped client with one extra header
+//	b11cun030_00000049_54d07b6d_c            the same curl, with a session field
+//
+// Distance between two tokens is the number of headers the two clients differ
+// by: the popcount of the XOR of the core maps plus the size of the symmetric
+// difference of the code lists. Header order never enters the token.
 package akin
 
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"math/bits"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -21,30 +35,38 @@ import (
 // SpecVersion is the leading character of every token. A format revision bumps
 // it so that parsers written against one version reject the next rather than
 // misreading it.
-const SpecVersion = "a"
+const SpecVersion = "b"
 
-// Vocab is normative. Bit i corresponds to Vocab[i]. Reordering it changes
-// every fingerprint and breaks distance comparability between implementations.
-var Vocab = [32]string{
-	"accept", "connection", "accept-encoding", "host",
-	"accept-language", "upgrade-insecure-requests", "user-agent", "range",
-	"cache-control", "content-length", "content-type", "sec-fetch-mode",
-	"pragma", "sec-fetch-dest", "sec-fetch-site", "sec-fetch-user",
-	"metadata-flavor", "metadata", "sec-ch-ua-platform", "sec-ch-ua-mobile",
-	"sec-ch-ua", "x-requested-with", "referer", "accept-charset",
-	"x-csrf-token", "proxy-authorization", "origin", "wsmanidentify",
-	"sec-gpc", "upgrade", "sec-websocket-version", "sec-websocket-key",
+// MaxExtras is the largest number of headers outside the core list that a
+// token carries by code. The prefix digit saturates at the same value.
+const MaxExtras = 9
+
+// Core is normative. Bit i of the core map is Core[i]. It is the 32 header
+// names with the highest presence entropy across 107,559 addresses that sent
+// HTTP to HoneyLabs sensors between 1 June and 29 September 2026, ordered by
+// that entropy, minimum 50 addresses. It is frozen: headers outside it are
+// carried by code in their own section, so the list never needs to grow.
+var Core = [32]string{
+	"connection", "accept-encoding", "accept", "accept-language",
+	"user-agent", "upgrade-insecure-requests", "sec-fetch-mode", "sec-fetch-site",
+	"sec-fetch-dest", "sec-fetch-user", "referer", "content-length",
+	"sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile", "sec-gpc",
+	"content-type", "accept-charset", "host", "priority",
+	"cache-control", "pragma", "authorization", "soapaction",
+	"dnt", "wsmanidentify", "x-aggregate-auth", "cookie",
+	"origin", "mcp-protocol-version", "upgrade", "x-forwarded-for",
 }
 
-var vocabIndex = func() map[string]uint {
-	m := make(map[string]uint, len(Vocab))
-	for i, n := range Vocab {
+var coreIndex = func() map[string]uint {
+	m := make(map[string]uint, len(Core))
+	for i, n := range Core {
 		m[n] = uint(i)
 	}
 	return m
 }()
 
-// negotiation headers contribute the grammar of their value, never the value.
+// negotiation headers contribute the grammar of their value to the detail
+// hash. The value itself never reaches the token.
 var negotiation = map[string]bool{
 	"accept": true, "accept-encoding": true, "accept-language": true,
 	"accept-charset": true, "connection": true, "te": true,
@@ -53,8 +75,8 @@ var negotiation = map[string]bool{
 
 type header struct{ name, value string }
 
-// Fingerprint returns the Akin token for a request head, or "" if the input is
-// not a parsable HTTP/1.x request.
+// Fingerprint returns the token for a request head, or "" if the input is not
+// a parsable HTTP/1.x request.
 func Fingerprint(data []byte) string {
 	return FingerprintSession(data, nil)
 }
@@ -68,68 +90,89 @@ func FingerprintSession(data []byte, sequence []int) string {
 		return ""
 	}
 
-	// Scratch space sized for the common case. Scanner requests carry a
-	// handful of headers, so this stays on the stack and the whole
-	// fingerprint runs without touching the heap.
-	var caseArr [24]byte
-	var lowBuf [64]byte
-	var shapeBuf [32]byte
-	casePattern := caseArr[:0]
-
-	sum := sha256.New()
-	var bits uint32
-	extra, negCount := 0, 0
-	dup, hasCL, hasTE := false, false, false
-
+	n := len(hdrs)
+	lows := make([]string, n)
 	for i, h := range hdrs {
-		// Compared against the original names rather than a lowered copy, so
-		// nothing has to outlive this iteration.
+		lows[i] = strings.ToLower(h.name)
+	}
+
+	// Core map, extra codes, and the three flags, in one pass.
+	var core uint32
+	extraCodes := make([]string, 0, 4)
+	seenExtra := map[string]bool{}
+	dup, hasCL, hasTE := false, false, false
+	for i, low := range lows {
 		for j := 0; j < i; j++ {
-			if strings.EqualFold(h.name, hdrs[j].name) {
+			if lows[j] == low {
 				dup = true
 				break
 			}
 		}
-		casePattern = append(casePattern, caseClass(h.name))
-
-		// Go compiles map and switch lookups keyed by string(someBytes)
-		// without allocating, so the lowered name never reaches the heap.
-		low := lowerASCII(h.name, lowBuf[:])
-		if idx, in := vocabIndex[string(low)]; in {
-			bits |= 1 << idx
-		} else {
-			extra++
+		if idx, in := coreIndex[low]; in {
+			core |= 1 << idx
+		} else if !seenExtra[low] {
+			seenExtra[low] = true
+			extraCodes = append(extraCodes, Code(low))
 		}
-		switch string(low) {
+		switch low {
 		case "content-length":
 			hasCL = true
 		case "transfer-encoding":
 			hasTE = true
 		}
-		if negotiation[string(low)] {
-			if negCount > 0 {
-				sum.Write([]byte{'|'})
-			}
-			negCount++
-			sum.Write(low)
-			sum.Write([]byte{'='})
-			sum.Write(shapeInto(h.value, shapeBuf[:0]))
+	}
+	sort.Strings(extraCodes)
+	extras := len(extraCodes)
+	if extras > MaxExtras {
+		extras = MaxExtras
+		extraCodes = extraCodes[:MaxExtras]
+	}
+
+	// Everything hashed is ordered by header name, never by position in the
+	// request: header order follows the disguise, not the client. Repeated
+	// names keep request order (the sort is stable); repeated negotiation
+	// names sort by value shape so that two implementations agree.
+	shapes := make([]string, n)
+	for i := range hdrs {
+		if negotiation[lows[i]] {
+			shapes[i] = Shape(hdrs[i].value)
 		}
 	}
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		if lows[order[a]] != lows[order[b]] {
+			return lows[order[a]] < lows[order[b]]
+		}
+		return shapes[order[a]] < shapes[order[b]]
+	})
+	sum := sha256.New()
+	first := true
+	for _, i := range order {
+		if !negotiation[lows[i]] {
+			continue
+		}
+		if !first {
+			sum.Write([]byte{'|'})
+		}
+		first = false
+		sum.Write([]byte(lows[i]))
+		sum.Write([]byte{'='})
+		sum.Write([]byte(shapes[i]))
+	}
 	sum.Write([]byte{'#'})
-	sum.Write(casePattern)
+	for _, i := range order {
+		sum.Write([]byte{caseClass(hdrs[i].name)})
+	}
 	var digest [sha256.Size]byte
 	sum.Sum(digest[:0])
 
-	n := len(hdrs)
 	if n > 99 {
 		n = 99
 	}
-	if extra > 9 {
-		extra = 9
-	}
-
-	out := make([]byte, 0, 40)
+	out := make([]byte, 0, 48)
 	out = append(out, SpecVersion...)
 	out = appendVersionDigits(out, version)
 	if crlf {
@@ -150,17 +193,21 @@ func FingerprintSession(data []byte, sequence []int) string {
 	default:
 		out = append(out, 'n')
 	}
-	out = append(out, byte('0'+n/10), byte('0'+n%10), byte('0'+extra))
-
+	out = append(out, byte('0'+n/10), byte('0'+n%10), byte('0'+extras))
 	out = append(out, '_')
 	for shift := 28; shift >= 0; shift -= 4 {
-		out = append(out, hexDigits[(bits>>uint(shift))&0xf])
+		out = append(out, hexDigits[(core>>uint(shift))&0xf])
 	}
 	out = append(out, '_')
 	for _, b := range digest[:4] {
 		out = append(out, hexDigits[b>>4], hexDigits[b&0xf])
 	}
-
+	if extras > 0 {
+		out = append(out, '_', 'x')
+		for _, c := range extraCodes {
+			out = append(out, c...)
+		}
+	}
 	if sequence != nil {
 		out = append(out, '_')
 		out = append(out, SessionField(sequence)...)
@@ -168,29 +215,150 @@ func FingerprintSession(data []byte, sequence []int) string {
 	return string(out)
 }
 
+// Code returns the four-hex-digit code a header name outside the core list is
+// carried by: the first two bytes of the SHA-256 of the lowercased name.
+// Anyone who knows a header name can compute its code, so a token's extra
+// headers can be read back against any list of names.
+func Code(name string) string {
+	d := sha256.Sum256([]byte(strings.ToLower(name)))
+	return hex.EncodeToString(d[:2])
+}
+
+// Lookup returns the code of every name in names, so a decoder can turn the
+// codes in a token back into header names it knows about.
+func Lookup(names []string) map[string]string {
+	m := make(map[string]string, len(names))
+	for _, n := range names {
+		m[Code(n)] = strings.ToLower(n)
+	}
+	return m
+}
+
+// Fields is a decoded token.
+type Fields struct {
+	Spec        byte     // format letter, 'b'
+	HTTPVersion string   // "11", "10", or "00" when unrecognised
+	CRLF        bool     // CRLF line endings, else bare LF
+	Duplicate   bool     // some header name repeats
+	Body        byte     // 'q' Content-Length, 'k' Transfer-Encoding, 'n' neither
+	Headers     int      // header count, capped at 99
+	Extras      int      // headers outside the core list, capped at MaxExtras
+	Core        uint32   // core map
+	CoreNames   []string // the names the core map sets, in Core order
+	Detail      string   // eight hex digits
+	Codes       []string // codes of the extra headers, sorted
+	Session     byte     // '1', 'c', 'g', or 0 when absent
+}
+
+// ErrMalformed is returned by Decode for anything that is not a format-b token.
+var ErrMalformed = errors.New("akin: malformed token")
+
+// Decode parses a token. It accepts only the current format.
+func Decode(token string) (Fields, error) {
+	var f Fields
+	parts := strings.Split(token, "_")
+	if len(parts) < 3 || len(parts) > 5 || len(parts[0]) != 9 || parts[0][0] != SpecVersion[0] {
+		return f, ErrMalformed
+	}
+	p := parts[0]
+	if !isDigit(p[1]) || !isDigit(p[2]) || !isDigit(p[6]) || !isDigit(p[7]) || !isDigit(p[8]) ||
+		(p[3] != 'c' && p[3] != 'l') || (p[4] != 'u' && p[4] != 'd') ||
+		(p[5] != 'n' && p[5] != 'q' && p[5] != 'k') {
+		return f, ErrMalformed
+	}
+	core, ok := parseHex32(parts[1])
+	if !ok || len(parts[2]) != 8 || !isHex(parts[2]) {
+		return f, ErrMalformed
+	}
+	f = Fields{Spec: p[0], HTTPVersion: p[1:3], CRLF: p[3] == 'c', Duplicate: p[4] == 'd', Body: p[5],
+		Headers: int(p[6]-'0')*10 + int(p[7]-'0'), Extras: int(p[8] - '0'), Core: core, Detail: parts[2]}
+	for i, name := range Core {
+		if core>>uint(i)&1 == 1 {
+			f.CoreNames = append(f.CoreNames, name)
+		}
+	}
+	for _, s := range parts[3:] {
+		switch {
+		case len(s) == 1 && (s[0] == '1' || s[0] == 'c' || s[0] == 'g') && f.Session == 0:
+			f.Session = s[0]
+		case len(s) > 1 && s[0] == 'x' && (len(s)-1)%4 == 0 && isHex(s[1:]) && f.Codes == nil && f.Session == 0:
+			for i := 1; i < len(s); i += 4 {
+				f.Codes = append(f.Codes, s[i:i+4])
+			}
+			if len(f.Codes) > MaxExtras || !sort.StringsAreSorted(f.Codes) {
+				return Fields{}, ErrMalformed
+			}
+		default:
+			return Fields{}, ErrMalformed
+		}
+	}
+	if f.Extras > 0 && len(f.Codes) != f.Extras || f.Extras == 0 && len(f.Codes) != 0 {
+		return Fields{}, ErrMalformed
+	}
+	return f, nil
+}
+
+// Distance reports how many headers two clients differ by: core headers by
+// the XOR of the core maps, headers outside the core list by the codes only
+// one of the two tokens carries. It returns -1 if either token is malformed.
+//
+// The result never overcounts. It can undercount when a request carries more
+// than MaxExtras headers outside the core list, or when two different header
+// names share a 16-bit code.
+func Distance(a, b string) int {
+	fa, ea := Decode(a)
+	fb, eb := Decode(b)
+	if ea != nil || eb != nil {
+		return -1
+	}
+	d := bits.OnesCount32(fa.Core ^ fb.Core)
+	i, j := 0, 0
+	for i < len(fa.Codes) && j < len(fb.Codes) {
+		switch {
+		case fa.Codes[i] == fb.Codes[j]:
+			i++
+			j++
+		case fa.Codes[i] < fb.Codes[j]:
+			d++
+			i++
+		default:
+			d++
+			j++
+		}
+	}
+	return d + (len(fa.Codes) - i) + (len(fb.Codes) - j)
+}
+
 const hexDigits = "0123456789abcdef"
 
-// lowerASCII lowercases into buf and returns the slice. Header names are
-// ASCII in every request this format targets; anything else falls back to a
-// general lowercase, which is the only path that allocates.
-func lowerASCII(s string, buf []byte) []byte {
-	if len(s) > len(buf) {
-		return []byte(strings.ToLower(s))
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] >= utf8.RuneSelf {
-			return []byte(strings.ToLower(s))
-		}
-	}
-	b := buf[:len(s)]
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func isHex(s string) bool {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
+		if !(isDigit(c) || (c >= 'a' && c <= 'f')) {
+			return false
 		}
-		b[i] = c
 	}
-	return b
+	return len(s) > 0
+}
+
+func parseHex32(s string) (uint32, bool) {
+	if len(s) != 8 || !isHex(s) {
+		return 0, false
+	}
+	var v uint32
+	for i := 0; i < 8; i++ {
+		c := s[i]
+		var d uint32
+		if isDigit(c) {
+			d = uint32(c - '0')
+		} else {
+			d = uint32(c-'a') + 10
+		}
+		v = v<<4 | d
+	}
+	return v, true
 }
 
 // caseClass classifies a header name's casing: a string is upper or
@@ -225,14 +393,8 @@ func caseClass(s string) byte {
 // ASCII digit runs become "9", and any run of three or more identical
 // characters is cut to two. The result is truncated to 24 runes.
 func Shape(value string) string {
-	return string(shapeInto(value, nil))
-}
-
-func shapeInto(value string, buf []byte) []byte {
 	v := strings.TrimSpace(value)
-	if buf == nil {
-		buf = make([]byte, 0, 32)
-	}
+	buf := make([]byte, 0, 32)
 	runes := 0
 	var prevClass byte
 	var lastRune rune
@@ -271,7 +433,7 @@ func shapeInto(value string, buf []byte) []byte {
 		runes++
 		buf = utf8.AppendRune(buf, emit)
 	}
-	return buf
+	return string(buf)
 }
 
 // SessionField is one character: "1" single request, "c" a contiguous run of
@@ -286,44 +448,6 @@ func SessionField(sequence []int) string {
 		}
 	}
 	return "c"
-}
-
-// Distance reports how many vocabulary headers two fingerprints differ by.
-// It returns -1 if either token is malformed.
-func Distance(a, b string) int {
-	ba, oka := bitmapOf(a)
-	bb, okb := bitmapOf(b)
-	if !oka || !okb {
-		return -1
-	}
-	return bits.OnesCount32(ba ^ bb)
-}
-
-func bitmapOf(fp string) (uint32, bool) {
-	first := strings.IndexByte(fp, '_')
-	if first < 0 {
-		return 0, false
-	}
-	rest := fp[first+1:]
-	second := strings.IndexByte(rest, '_')
-	if second != 8 {
-		return 0, false
-	}
-	var v uint32
-	for i := 0; i < 8; i++ {
-		c := rest[i]
-		var d uint32
-		switch {
-		case c >= '0' && c <= '9':
-			d = uint32(c - '0')
-		case c >= 'a' && c <= 'f':
-			d = uint32(c-'a') + 10
-		default:
-			return 0, false
-		}
-		v = v<<4 | d
-	}
-	return v, true
 }
 
 // appendVersionDigits writes exactly two digits, so the readable prefix is
@@ -403,7 +527,6 @@ func nextLine(s string) (line, rest string) {
 	line = strings.TrimSuffix(line, "\r")
 	return line, s[i+1:]
 }
-
 func sanitize(b []byte) string {
 	if utf8.Valid(b) {
 		return string(b)

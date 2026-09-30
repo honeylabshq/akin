@@ -21,17 +21,24 @@ func FuzzFingerprint(f *testing.F) {
 			return
 		}
 		parts := strings.Split(fp, "_")
-		if len(parts) != 3 {
-			t.Fatalf("expected three sections, got %q", fp)
+		if len(parts) != 3 && len(parts) != 4 {
+			t.Fatalf("expected three or four sections, got %q", fp)
 		}
 		if len(parts[0]) != 9 {
 			t.Fatalf("prefix must be 9 chars: %q", fp)
 		}
 		if len(parts[1]) != 8 {
-			t.Fatalf("bitmap must be 8 hex digits: %q", fp)
+			t.Fatalf("core map must be 8 hex digits: %q", fp)
 		}
 		if len(parts[2]) != 8 {
 			t.Fatalf("detail must be 8 hex digits: %q", fp)
+		}
+		f, err := Decode(fp)
+		if err != nil {
+			t.Fatalf("Decode(%q): %v", fp, err)
+		}
+		if (f.Extras > 0) != (len(parts) == 4) {
+			t.Fatalf("extras digit and section disagree: %q", fp)
 		}
 		if d := Distance(fp, fp); d != 0 {
 			t.Fatalf("Distance to self = %d for %q", d, fp)

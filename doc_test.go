@@ -45,11 +45,12 @@ func TestSpecCoreMatchesCode(t *testing.T) {
 }
 
 // TestDocumentedTokensReproduce recomputes every fingerprint printed in the
-// README and the spec, so documentation cannot claim output the code no longer
+// README, the spec and the package documentation, so documentation cannot claim output the code no longer
 // produces.
 func TestDocumentedTokensReproduce(t *testing.T) {
 	documented := map[string]string{
 		"README.md": "GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n",
+		"akin.go":   "GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n",
 	}
 	for file, request := range documented {
 		raw, err := os.ReadFile(file)
@@ -66,7 +67,7 @@ func TestDocumentedTokensReproduce(t *testing.T) {
 	}
 	// Every token-shaped string in the docs must at least be well formed.
 	token := regexp.MustCompile(`\bb[0-9]{2}[cl][du][qkn][0-9]{3}_[0-9a-f]{8}_[0-9a-f]{8}(?:_x[0-9a-f]{4,36})?(?:_[1cg])?\b`)
-	for _, file := range []string{"README.md", "SPEC.md"} {
+	for _, file := range []string{"README.md", "SPEC.md", "akin.go"} {
 		raw, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)

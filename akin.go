@@ -11,9 +11,9 @@
 // 16-bit codes for the headers outside the core list, and an optional
 // session field:
 //
-//	b11cun030_00000049_54d07b6d              default curl
-//	b11cun141_1c3e8c8b_9f0d6a11_x0c47        a browser-shaped client with one extra header
-//	b11cun030_00000049_54d07b6d_c            the same curl, with a session field
+//	b11cun030_00040014_54d07b6d                 default curl
+//	b11cdn053_00040000_2e792dd9_x22692f93bcb1   Host plus three headers outside the core list
+//	b11cun030_00040014_54d07b6d_c               the same curl, with a session field
 //
 // Distance between two tokens is the number of headers the two clients differ
 // by: the popcount of the XOR of the core maps plus the size of the symmetric
@@ -99,15 +99,14 @@ func FingerprintSession(data []byte, sequence []int) string {
 	// Core map, extra codes, and the three flags, in one pass.
 	var core uint32
 	extraCodes := make([]string, 0, 4)
+	seen := make(map[string]bool, n)
 	seenExtra := map[string]bool{}
 	dup, hasCL, hasTE := false, false, false
-	for i, low := range lows {
-		for j := 0; j < i; j++ {
-			if lows[j] == low {
-				dup = true
-				break
-			}
+	for _, low := range lows {
+		if seen[low] {
+			dup = true
 		}
+		seen[low] = true
 		if idx, in := coreIndex[low]; in {
 			core |= 1 << idx
 		} else if !seenExtra[low] {

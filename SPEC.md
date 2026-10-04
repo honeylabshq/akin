@@ -5,10 +5,11 @@ comparable with format b tokens and a format b decoder rejects them.
 
 ## What this is for
 
-Akin identifies an HTTP/1.x client from a single bare request head. It needs no
-packet capture, no TLS handshake and no connection state, so it can be computed
-anywhere the request bytes are available: a honeypot, a reverse proxy log, a
-WAF, or a stored column in a database.
+Akin identifies an HTTP client from a single request: an HTTP/1.x request
+head, or the field list of an HTTP/2 or HTTP/3 request. It needs no packet
+capture, no TLS handshake and no connection state, so it can be computed
+anywhere the request is available: a honeypot, a reverse proxy log, a WAF, or
+a stored column in a database.
 
 It is aimed at scanner and crawler traffic, which is what honeypots and edge
 logs mostly see.
@@ -38,10 +39,10 @@ Examples:
 | Section | Width | Meaning |
 |---|---|---|
 | `spec` | 1 | Format letter, `b`. A revision changes it so a decoder for one format rejects the next instead of misreading it |
-| `ver` | 2 | HTTP version digits, `11` or `10`. A request line with no recognisable HTTP/1.x version gives `00` |
-| `eol` | 1 | `c` if the head uses CRLF, `l` if bare LF |
+| `ver` | 2 | HTTP version digits: `1` and the minor digit of an `HTTP/1.x` request line, `20` for HTTP/2, `30` for HTTP/3. Any other request-line version gives `00` |
+| `eol` | 1 | `c` if the head uses CRLF, `l` if bare LF, `h` for an HTTP/2 or HTTP/3 field list. The blank line that ends the head counts, so a head with no headers still reports its line ending |
 | `dup` | 1 | `d` if any header name repeats, compared case-insensitively, else `u` |
-| `body` | 1 | `q` Content-Length, `k` Transfer-Encoding, `n` neither |
+| `body` | 1 | `q` Content-Length, `k` Transfer-Encoding, `b` both, `n` neither |
 | `nhdr` | 2 | Header count, capped at 99 |
 | `extra` | 1 | Distinct header names outside the core list, capped at 9 |
 | `core` | 8 | 32-bit presence map over the core list, big-endian hex |
@@ -109,6 +110,36 @@ threw the names away.
 Two different names share a code with probability 1 in 65,536. A collision
 makes two clients that differ in those two headers look one header closer than
 they are; it can never make them look further apart.
+
+## Request head
+
+The head ends at the first blank line, CRLF CRLF or LF LF, whichever comes
+first; anything after it is body and never read as headers. The request line
+must have exactly three space-separated fields. A header is a line with a
+colon; the name is everything before the first colon, kept as sent.
+
+## HTTP/2 and HTTP/3
+
+Both protocols deliver a request as a list of fields, and Akin reads that
+list after HPACK or QPACK decoding. The two share one procedure and differ
+only in the version digits.
+
+- Pseudo-header fields are dropped, except `:authority`, which counts as a
+  `host` header in its position. It carries what Host carries in HTTP/1.x, so
+  the core map of one client stays comparable across versions.
+- Repeated `cookie` fields count as one header in the position of the first.
+  Both protocols let a client split Cookie into crumbs, and a recipient must
+  join them.
+- Everything else, the duplicate flag included, follows the HTTP/1.x rules.
+
+Both protocols require lowercase field names, so the casing pattern of a
+conforming client is all `l`. Connection-specific headers such as
+`connection`, `upgrade` and `transfer-encoding` are forbidden in both, so
+their presence marks a client that breaks the protocol.
+
+Frame-level signals (SETTINGS values, WINDOW_UPDATE, PRIORITY, pseudo-header
+order, QUIC transport parameters) are out of scope: they need the connection,
+and Akin reads one request.
 
 ## Detail hash
 
@@ -188,9 +219,10 @@ section, whose codes are unsorted, or whose sections are out of order.
 
 ## Limits
 
-HTTP/1.x only. The corpus this was built and measured on is scanner and crawler
-traffic reaching one honeypot network, whose listeners speak HTTP/1.1 only, so
-Akin makes no claim about HTTP/2 or HTTP/3 clients.
+The corpus this was built and measured on is scanner and crawler traffic
+reaching one honeypot network, whose listeners speak HTTP/1.1 only. The
+HTTP/2 and HTTP/3 procedure follows from the protocols and has not been
+measured on traffic.
 
 The core list is tuned to that traffic. A population of ordinary browser
 sessions would spend its bits differently, and a client that sends many

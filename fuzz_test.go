@@ -45,3 +45,20 @@ func FuzzFingerprint(f *testing.F) {
 		}
 	})
 }
+
+// FuzzFields feeds arbitrary field lists, one "name=value" per line, through
+// the HTTP/2 path. Every token must decode.
+func FuzzFields(f *testing.F) {
+	f.Add([]byte(":authority=a\nuser-agent=x\ncookie=a\ncookie=b"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var fields []Field
+		for _, line := range strings.Split(string(data), "\n") {
+			name, value, _ := strings.Cut(line, "=")
+			fields = append(fields, Field{name, value})
+		}
+		fp := FingerprintFields(2, fields)
+		if _, err := Decode(fp); err != nil {
+			t.Fatalf("Decode(%q): %v", fp, err)
+		}
+	})
+}

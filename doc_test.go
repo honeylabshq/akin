@@ -66,7 +66,7 @@ func TestDocumentedTokensReproduce(t *testing.T) {
 		}
 	}
 	// Every token-shaped string in the docs must at least be well formed.
-	token := regexp.MustCompile(`\bb[0-9]{2}[cl][du][qkn][0-9]{3}_[0-9a-f]{8}_[0-9a-f]{8}(?:_x[0-9a-f]{4,36})?(?:_[1cg])?\b`)
+	token := regexp.MustCompile(`\bb[0-9]{2}[clh][du][qknb][0-9]{3}_[0-9a-f]{8}_[0-9a-f]{8}(?:_x[0-9a-f]{4,36})?(?:_[1cg])?\b`)
 	for _, file := range []string{"README.md", "SPEC.md", "akin.go"} {
 		raw, err := os.ReadFile(file)
 		if err != nil {

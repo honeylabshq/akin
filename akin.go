@@ -1,9 +1,10 @@
 // Package akin computes the Akin HTTP request fingerprint, format b.
 //
-// Akin identifies an HTTP/1.x client from a single bare request head. It needs
-// no packet capture, no TLS handshake and no connection state, so it can be
-// computed wherever the request bytes are available: a honeypot, a proxy log,
-// a WAF, a stored column.
+// Akin identifies an HTTP client from a single request: an HTTP/1.x request
+// head, or the field list of an HTTP/2 or HTTP/3 request. It needs no packet
+// capture, no TLS handshake and no connection state, so it can be computed
+// wherever the request is available: a honeypot, a proxy log, a WAF, a stored
+// column.
 //
 // A token has a nine-character readable prefix, a 32-bit map over a frozen
 // core list of header names, a hash over the grammar of the negotiation
@@ -89,7 +90,61 @@ func FingerprintSession(data []byte, sequence []int) string {
 	if !ok {
 		return ""
 	}
+	eol := byte('l')
+	if crlf {
+		eol = 'c'
+	}
+	return build(versionDigits(version), eol, hdrs, sequence)
+}
 
+// Field is one header field of a request as an HTTP/2 or HTTP/3 server
+// decodes it, pseudo-header fields included.
+type Field struct{ Name, Value string }
+
+// FingerprintFields returns the token for a request decoded from HTTP/2
+// (version 2) or HTTP/3 (version 3), or "" for any other version. The two
+// protocols carry the same field list, so they share one path and differ only
+// in the version digits. The line-ending flag is "h", since neither protocol
+// has line endings.
+//
+// Pseudo-header fields are dropped, except :authority, which counts as Host:
+// it carries what Host carries in HTTP/1.x, and mapping it keeps the core map
+// comparable across versions. Repeated Cookie fields are one header, because
+// HTTP/2 and HTTP/3 let a client split Cookie into crumbs and a recipient
+// must join them.
+func FingerprintFields(version int, fields []Field) string {
+	var digits string
+	switch version {
+	case 2:
+		digits = "20"
+	case 3:
+		digits = "30"
+	default:
+		return ""
+	}
+	hdrs := make([]header, 0, len(fields))
+	cookie := false
+	for _, f := range fields {
+		name := f.Name
+		switch {
+		case name == ":authority":
+			name = "host"
+		case strings.HasPrefix(name, ":"):
+			continue
+		case strings.EqualFold(name, "cookie"):
+			if cookie {
+				continue
+			}
+			cookie = true
+		}
+		hdrs = append(hdrs, header{name: name, value: f.Value})
+	}
+	return build(digits, 'h', hdrs, nil)
+}
+
+// build computes the token from the version digits, the line-ending flag and
+// the header list.
+func build(digits string, eol byte, hdrs []header, sequence []int) string {
 	n := len(hdrs)
 	lows := make([]string, n)
 	for i, h := range hdrs {
@@ -173,18 +228,16 @@ func FingerprintSession(data []byte, sequence []int) string {
 	}
 	out := make([]byte, 0, 48)
 	out = append(out, SpecVersion...)
-	out = appendVersionDigits(out, version)
-	if crlf {
-		out = append(out, 'c')
-	} else {
-		out = append(out, 'l')
-	}
+	out = append(out, digits...)
+	out = append(out, eol)
 	if dup {
 		out = append(out, 'd')
 	} else {
 		out = append(out, 'u')
 	}
 	switch {
+	case hasCL && hasTE:
+		out = append(out, 'b')
 	case hasCL:
 		out = append(out, 'q')
 	case hasTE:
@@ -236,10 +289,11 @@ func Lookup(names []string) map[string]string {
 // Fields is a decoded token.
 type Fields struct {
 	Spec        byte     // format letter, 'b'
-	HTTPVersion string   // "11", "10", or "00" when unrecognised
-	CRLF        bool     // CRLF line endings, else bare LF
+	HTTPVersion string   // "11", "10", "20", "30", or "00" when unrecognised
+	CRLF        bool     // CRLF line endings
+	EOL         byte     // 'c' CRLF, 'l' bare LF, 'h' HTTP/2 or HTTP/3 fields
 	Duplicate   bool     // some header name repeats
-	Body        byte     // 'q' Content-Length, 'k' Transfer-Encoding, 'n' neither
+	Body        byte     // 'q' Content-Length, 'k' Transfer-Encoding, 'b' both, 'n' neither
 	Headers     int      // header count, capped at 99
 	Extras      int      // headers outside the core list, capped at MaxExtras
 	Core        uint32   // core map
@@ -261,15 +315,15 @@ func Decode(token string) (Fields, error) {
 	}
 	p := parts[0]
 	if !isDigit(p[1]) || !isDigit(p[2]) || !isDigit(p[6]) || !isDigit(p[7]) || !isDigit(p[8]) ||
-		(p[3] != 'c' && p[3] != 'l') || (p[4] != 'u' && p[4] != 'd') ||
-		(p[5] != 'n' && p[5] != 'q' && p[5] != 'k') {
+		(p[3] != 'c' && p[3] != 'l' && p[3] != 'h') || (p[4] != 'u' && p[4] != 'd') ||
+		(p[5] != 'n' && p[5] != 'q' && p[5] != 'k' && p[5] != 'b') {
 		return f, ErrMalformed
 	}
 	core, ok := parseHex32(parts[1])
 	if !ok || len(parts[2]) != 8 || !isHex(parts[2]) {
 		return f, ErrMalformed
 	}
-	f = Fields{Spec: p[0], HTTPVersion: p[1:3], CRLF: p[3] == 'c', Duplicate: p[4] == 'd', Body: p[5],
+	f = Fields{Spec: p[0], HTTPVersion: p[1:3], CRLF: p[3] == 'c', EOL: p[3], Duplicate: p[4] == 'd', Body: p[5],
 		Headers: int(p[6]-'0')*10 + int(p[7]-'0'), Extras: int(p[8] - '0'), Core: core, Detail: parts[2]}
 	for i, name := range Core {
 		if core>>uint(i)&1 == 1 {
@@ -449,43 +503,31 @@ func SessionField(sequence []int) string {
 	return "c"
 }
 
-// appendVersionDigits writes exactly two digits, so the readable prefix is
-// always nine characters and a parser can index it. A request line carrying no
-// recognisable HTTP/1.x version yields "00".
-func appendVersionDigits(out []byte, version string) []byte {
-	if i := strings.LastIndexByte(version, '/'); i >= 0 {
-		version = version[i+1:]
+// versionDigits returns the two version digits of an HTTP/1.x request line,
+// so the readable prefix is always nine characters and a parser can index it.
+// Anything other than "HTTP/1." and one digit yields "00".
+func versionDigits(version string) string {
+	if len(version) == 8 && strings.HasPrefix(version, "HTTP/1.") && isDigit(version[7]) {
+		return "1" + version[7:]
 	}
-	var digits [2]byte
-	n := 0
-	for i := 0; i < len(version); i++ {
-		c := version[i]
-		if c == '.' {
-			continue
-		}
-		if n == 2 || c < '0' || c > '9' {
-			return append(out, '0', '0')
-		}
-		digits[n] = c
-		n++
-	}
-	if n != 2 {
-		return append(out, '0', '0')
-	}
-	return append(out, digits[0], digits[1])
+	return "00"
 }
 
 // parseHead splits a request head into its version, headers and line ending.
 // Invalid UTF-8 is replaced byte by byte with U+FFFD.
 func parseHead(data []byte) (version string, hdrs []header, crlf bool, ok bool) {
-	head := data
+	// The head ends at whichever blank line comes first, so a body can never
+	// be read as headers. The line ending is judged on the head including its
+	// terminator, so a request with no headers still reports it.
+	end, term := len(data), 0
 	if i := bytes.Index(data, []byte("\r\n\r\n")); i >= 0 {
-		head = data[:i]
-	} else if i := bytes.Index(data, []byte("\n\n")); i >= 0 {
-		head = data[:i]
+		end, term = i, 4
 	}
-	text := sanitize(head)
-	crlf = strings.Contains(text, "\r\n")
+	if i := bytes.Index(data, []byte("\n\n")); i >= 0 && i < end {
+		end, term = i, 2
+	}
+	text := sanitize(data[:end])
+	crlf = bytes.Contains(data[:end+term], []byte("\r\n"))
 
 	line, rest := nextLine(text)
 	sp1 := strings.IndexByte(line, ' ')

@@ -3,7 +3,9 @@
 //
 // By default it reads one raw request head from stdin. With -hex it reads one
 // hex-encoded request per line, which is the form request bytes usually take
-// in a log or a column of a database.
+// in a log or a column of a database. With -fields 2 or -fields 3 it reads an
+// HTTP/2 or HTTP/3 field list, one "name: value" per line, pseudo-headers
+// included.
 package main
 
 import (
@@ -22,6 +24,7 @@ func main() {
 	hexMode := flag.Bool("hex", false, "read one hex-encoded request per line")
 	decode := flag.String("decode", "", "print the fields of a token")
 	distance := flag.String("distance", "", "two tokens separated by a space: print how many headers they differ by")
+	fields := flag.Int("fields", 0, "read an HTTP/2 (2) or HTTP/3 (3) field list, one \"name: value\" per line")
 	names := flag.String("names", "", "comma-separated header names to resolve extra-header codes against when decoding")
 	flag.Parse()
 
@@ -30,6 +33,8 @@ func main() {
 		printFields(*decode, *names)
 	case *distance != "":
 		printDistance(*distance)
+	case *fields != 0:
+		fieldList(*fields)
 	case *hexMode:
 		hexLines()
 	default:
@@ -45,6 +50,29 @@ func one() {
 	fp := akin.Fingerprint(raw)
 	if fp == "" {
 		fail(fmt.Errorf("not a parsable HTTP/1.x request"))
+	}
+	fmt.Println(fp)
+}
+
+func fieldList(version int) {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fail(err)
+	}
+	var list []akin.Field
+	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		// A pseudo-header starts with a colon, so the separator is the
+		// first colon after the first character.
+		i := strings.IndexByte(line[min(1, len(line)):], ':') + min(1, len(line))
+		if i < 1 {
+			fail(fmt.Errorf("field without a colon: %q", line))
+		}
+		list = append(list, akin.Field{Name: line[:i], Value: strings.TrimSpace(line[i+1:])})
+	}
+	fp := akin.FingerprintFields(version, list)
+	if fp == "" {
+		fail(fmt.Errorf("-fields takes 2 or 3"))
 	}
 	fmt.Println(fp)
 }
@@ -73,11 +101,8 @@ func printFields(token, names string) {
 		fail(err)
 	}
 	known := akin.Lookup(strings.Split(names, ","))
-	body := map[byte]string{'n': "none", 'q': "Content-Length", 'k': "Transfer-Encoding"}[f.Body]
-	eol := "LF"
-	if f.CRLF {
-		eol = "CRLF"
-	}
+	body := map[byte]string{'n': "none", 'q': "Content-Length", 'k': "Transfer-Encoding", 'b': "both"}[f.Body]
+	eol := map[byte]string{'c': "CRLF", 'l': "LF", 'h': "none (HTTP/2 or HTTP/3)"}[f.EOL]
 	fmt.Printf("http      %s.%s\n", f.HTTPVersion[:1], f.HTTPVersion[1:])
 	fmt.Printf("eol       %s\n", eol)
 	fmt.Printf("duplicate %v\n", f.Duplicate)

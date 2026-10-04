@@ -4,8 +4,9 @@ An open HTTP request fingerprint.
 
     b11cun030_00040014_54d07b6d
 
-Akin identifies an HTTP/1.x client from a single bare request head. No pcap, no
-TLS handshake, no connection state, so it works anywhere the request bytes are
+Akin identifies an HTTP client from a single request: an HTTP/1.x request
+head, or the decoded field list of an HTTP/2 or HTTP/3 request. No pcap, no
+TLS handshake, no connection state, so it works anywhere the request is
 available: a honeypot, a proxy log, a WAF, a stored column in a database.
 
 Two tokens compare without a lookup table: the middle section is a presence map
@@ -20,6 +21,7 @@ token, and the value of `User-Agent` never does either.
 import "github.com/honeylabshq/akin"
 
 fp := akin.Fingerprint(requestBytes)   // "" if not a parsable HTTP/1.x request
+fp2 := akin.FingerprintFields(2, fields) // HTTP/2 field list; 3 for HTTP/3
 d := akin.Distance(fpA, fpB)           // headers they differ by, -1 if malformed
 f, err := akin.Decode(fp)              // the readable fields
 ```
@@ -31,6 +33,9 @@ $ printf 'GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n
 b11cun030_00040014_54d07b6d
 
 $ akin -hex < payloads.hex   # one hex-encoded request per line
+
+$ printf ':method: GET\n:path: /\n:authority: a\nuser-agent: curl/8.5.0\naccept: */*\n' | akin -fields 2
+b20hun030_00040014_03330a18
 
 $ akin -decode b11cdn053_00040000_2e792dd9_x22692f93bcb1 -names range,x-foo,x-bar
 http      1.1
@@ -56,5 +61,3 @@ The format is specified in [SPEC.md](SPEC.md). The vectors in
 
 Bit positions in the core list are normative and frozen. Reordering them
 changes every token, so `TestCoreFrozen` fails if anyone tries.
-
-HTTP/1.x only.

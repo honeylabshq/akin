@@ -310,3 +310,41 @@ func TestOrderIndependent(t *testing.T) {
 		t.Errorf("a different negotiation value shape must change the detail hash: %s", a)
 	}
 }
+
+// TestFields covers HTTP/2 and HTTP/3 field lists: pseudo-headers other than
+// :authority are dropped, :authority counts as Host, cookie crumbs are one
+// header, and the core map matches the same client over HTTP/1.1.
+func TestFields(t *testing.T) {
+	curl := []Field{
+		{":method", "GET"}, {":path", "/"}, {":scheme", "https"}, {":authority", "a"},
+		{"user-agent", "curl/8.5.0"}, {"accept", "*/*"},
+	}
+	h1 := Fingerprint([]byte("GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n"))
+	h2 := FingerprintFields(2, curl)
+	h3 := FingerprintFields(3, curl)
+	if !strings.HasPrefix(h2, "b20hun030_00040014_") || !strings.HasPrefix(h3, "b30hun030_00040014_") {
+		t.Fatalf("got %q and %q", h2, h3)
+	}
+	if h2[3:] != h3[3:] {
+		t.Errorf("HTTP/2 and HTTP/3 differ beyond the version: %q %q", h2, h3)
+	}
+	if d := Distance(h1, h2); d != 0 {
+		t.Errorf("Distance(HTTP/1.1, HTTP/2) = %d, want 0", d)
+	}
+
+	crumbs := append(curl[:len(curl):len(curl)], Field{"cookie", "a=1"}, Field{"cookie", "b=2"})
+	if got := FingerprintFields(2, crumbs); !strings.HasPrefix(got, "b20hun040_") {
+		t.Errorf("cookie crumbs: got %q, want one cookie header and no duplicate flag", got)
+	}
+	both := append(curl[:len(curl):len(curl)], Field{"host", "a"})
+	if got := FingerprintFields(2, both); !strings.HasPrefix(got, "b20hdn040_") {
+		t.Errorf(":authority plus host: got %q, want the duplicate flag", got)
+	}
+	if got := FingerprintFields(1, curl); got != "" {
+		t.Errorf("version 1: got %q, want empty", got)
+	}
+	f, err := Decode(h2)
+	if err != nil || f.EOL != 'h' || f.CRLF || f.HTTPVersion != "20" {
+		t.Errorf("Decode(%q) = %+v, %v", h2, f, err)
+	}
+}

@@ -2,7 +2,7 @@
   {
     "name": "minimal",
     "request_hex": "474554202f20485454502f312e300d0a0d0a",
-    "fingerprint": "b10lun000_00000000_334359b9"
+    "fingerprint": "b10cun000_00000000_334359b9"
   },
   {
     "name": "host only",
@@ -88,5 +88,30 @@
     "name": "repeated negotiation header, other order",
     "request_hex": "474554202f20485454502f312e310d0a486f73743a20610d0a4163636570743a202a2f2a0d0a4163636570743a20746578742f68746d6c0d0a0d0a",
     "fingerprint": "b11cdn030_00040004_0b8dfbe0"
+  },
+  {
+    "name": "no headers, CRLF",
+    "request_hex": "474554202f20485454502f312e310d0a0d0a",
+    "fingerprint": "b11cun000_00000000_334359b9"
+  },
+  {
+    "name": "LF head, CRLF blank line in body",
+    "request_hex": "504f5354202f20485454502f312e310a486f73743a20610a436f6e74656e742d4c656e6774683a2031330a0a783a20310d0a0d0a797a",
+    "fingerprint": "b11luq020_00040800_724c10fb"
+  },
+  {
+    "name": "Content-Length and Transfer-Encoding",
+    "request_hex": "504f5354202f20485454502f312e310d0a486f73743a20610d0a436f6e74656e742d4c656e6774683a20340d0a5472616e736665722d456e636f64696e673a206368756e6b65640d0a0d0a",
+    "fingerprint": "b11cub031_00040800_e62b6d85_xed80"
+  },
+  {
+    "name": "HTTP/2.0 on a text request line",
+    "request_hex": "474554202f20485454502f322e300d0a486f73743a20610d0a0d0a",
+    "fingerprint": "b00cun010_00040000_c4b2c4aa"
+  },
+  {
+    "name": "lowercase http version",
+    "request_hex": "474554202f20687474702f312e310d0a486f73743a20610d0a0d0a",
+    "fingerprint": "b00cun010_00040000_c4b2c4aa"
   }
 ]

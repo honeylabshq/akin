@@ -1,34 +1,33 @@
 # Akin
 
-An open HTTP request fingerprint.
+Akin is an open fingerprint for HTTP clients. It reads one request and writes a
+short token, and the distance between two tokens is the number of headers the
+two clients differ by.
 
     b11cun030_00040014_54d07b6d
 
-Akin identifies an HTTP client from a single request: an HTTP/1.x request
-head, or the decoded field list of an HTTP/2 or HTTP/3 request. No pcap, no
-TLS handshake, no connection state, so it works anywhere the request is
-available: a honeypot, a proxy log, a WAF, a stored column in a database.
+That token is curl 8.5 with its default headers. Akin needs only the request,
+so it runs anywhere requests are seen or stored: a honeypot, a proxy or WAF
+log, or a column in a database. It reads HTTP/1.x request heads as raw bytes,
+and HTTP/2 and HTTP/3 requests as the field list the server decoded.
 
-Two tokens compare without a lookup table: the middle section is a presence map
-over a frozen list of 32 header names, and headers outside that list travel as
-short codes in their own section, so the distance between two tokens is the
-number of headers the two clients differ by. Header order never enters the
-token, and the value of `User-Agent` never does either.
+## Install
 
-## Use
+    go get github.com/honeylabshq/akin
+    go install github.com/honeylabshq/akin/cmd/akin@latest
+
+## Go
 
 ```go
-import "github.com/honeylabshq/akin"
-
-fp := akin.Fingerprint(requestBytes)   // "" if not a parsable HTTP/1.x request
-fp2 := akin.FingerprintFields(2, fields) // HTTP/2 field list; 3 for HTTP/3
-d := akin.Distance(fpA, fpB)           // headers they differ by, -1 if malformed
-f, err := akin.Decode(fp)              // the readable fields
+fp := akin.Fingerprint(requestBytes)     // HTTP/1.x head, "" if it does not parse
+fp2 := akin.FingerprintFields(2, fields) // HTTP/2 field list, 3 for HTTP/3
+d := akin.Distance(fp, fp2)              // headers they differ by, -1 if malformed
+f, err := akin.Decode(fp)                // the readable fields
 ```
 
-```
-$ go install github.com/honeylabshq/akin/cmd/akin@latest
+## Command line
 
+```
 $ printf 'GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n' | akin
 b11cun030_00040014_54d07b6d
 
@@ -51,13 +50,40 @@ $ akin -distance "b11cun030_00040014_54d07b6d b11cdn053_00040000_2e792dd9_x22692
 5
 ```
 
+## The token
+
+The first nine characters are readable: format letter, HTTP version, line
+ending, duplicate flag, body signal, header count and the number of headers
+outside the core list. The next eight are a 32-bit map of which headers from a
+fixed list of 32 names the request carried. A header outside that list is
+carried as a four-digit code in its own section, so a difference in any header
+counts toward the distance. The last eight characters hash the grammar of the
+negotiation headers and the capitalisation of the header names.
+
+Header order and the User-Agent value are left out, because a scanner changes
+both between requests while the set of headers its HTTP library sends stays
+the same. [SPEC.md](SPEC.md) has the format, the core list and the
+measurements behind each choice.
+
+## Background
+
+Akin follows p0f, Michal Zalewski's passive fingerprinting tool, which added
+HTTP signatures in version 3 in 2012. A p0f HTTP signature describes a client
+by which headers it sends from a list of known names, and the core map in an
+Akin token does the same.
+
+The idea of a short fingerprint string that analysts can share and search for
+comes from JA3, the TLS client fingerprint John Althouse, Jeff Atkinson and
+Josh Atkins published at Salesforce in 2017, and from HASSH, the SSH
+fingerprint Ben Reardon and Adel Karimi published at Salesforce in 2018. Akin
+applies that idea to HTTP requests and adds a distance, so two tokens that are
+not equal still say how close the clients are.
+
 ## Status
 
-Draft, so treat the format as unstable. Licensed under Apache-2.0, which
-carries an express patent grant, so anyone adopting Akin gets one.
+The format is a draft until version 1.0. The bit positions of the core list
+are already fixed, and `TestCoreFrozen` fails if they are reordered. The
+vectors in `testdata/vectors.json` pin the output, and CI checks every one.
 
-The format is specified in [SPEC.md](SPEC.md). The vectors in
-`testdata/vectors.json` pin the implementation, and CI checks every one.
-
-Bit positions in the core list are normative and frozen. Reordering them
-changes every token, so `TestCoreFrozen` fails if anyone tries.
+Licensed under Apache-2.0, which includes a patent grant from every
+contributor.

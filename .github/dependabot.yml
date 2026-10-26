@@ -1,0 +1,13 @@
+version: 2
+
+# The workflow pins its actions to commit SHAs with the version in a trailing
+# comment. Dependabot reads that comment, moves the SHA and the comment
+# together, and groups the whole set into one weekly pull request.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

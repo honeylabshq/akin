@@ -50,6 +50,30 @@ $ akin -distance "b11cun030_00040014_54d07b6d b11cdn053_00040000_2e792dd9_x22692
 5
 ```
 
+## With a web server
+
+Akin reads the request as it arrived on the wire: the order of the header
+lines, their casing and the line endings. A server that parses headers into a
+map before it logs them has already lost all three, which is the case for the
+standard log formats of nginx and Apache. Compute the token where the raw
+request is still available:
+
+- In front of the server. [caddy-akin](https://rud.is/git/caddy-akin/) is a
+  community Caddy module that writes the token to Caddy's access log and can
+  block on it; put Caddy in front of nginx or Apache to get tokens for their
+  traffic.
+- From a capture. `akin -hex` reads one hex-encoded request per line, so any
+  capture tool that can print the raw bytes of each HTTP request feeds it. A
+  request taken from a file works the same way:
+
+```
+$ xxd -p request.bin | tr -d '\n' | akin -hex
+b11cun030_00040014_54d07b6d
+```
+
+The Go package computes the token from the raw bytes too (`akin.Fingerprint`)
+for servers written in Go that can reach the connection before parsing.
+
 ## The token
 
 The first nine characters are readable: format letter, HTTP version, line

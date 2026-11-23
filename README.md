@@ -1,5 +1,7 @@
 # Akin
 
+Maintained by [HoneyLabs, honeypot threat intelligence](https://honeylabs.net).
+
 Akin is an open fingerprint for HTTP clients. It reads one request and writes a
 short token, and the distance between two tokens is the number of headers the
 two clients differ by.
